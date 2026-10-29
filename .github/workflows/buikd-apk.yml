@@ -1,0 +1,84 @@
+name: Build Android APK
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: build-apk
+  cancel-in-progress: true
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1) If a project ZIP is sitting in the repo root, unpack it into the repo.
+      # (.github/ is skipped on purpose: GITHUB_TOKEN may not modify workflow files.)
+      - name: Unpack project ZIP
+        run: |
+          ZIP=$(ls -1 *.zip 2>/dev/null | head -n1 || true)
+          if [ -n "$ZIP" ]; then
+            echo "Unpacking $ZIP"
+            rm -rf _unz && mkdir _unz && unzip -q "$ZIP" -d _unz
+            SRC=_unz
+            if [ "$(ls -A _unz | wc -l)" = "1" ] && [ -d "_unz/$(ls -A _unz)" ]; then SRC="_unz/$(ls -A _unz)"; fi
+            rsync -a --exclude '.github' "$SRC"/ ./
+            rm -rf _unz
+            git rm -q --cached "$ZIP" || true
+            rm -f "$ZIP"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -A
+            git commit -m "Unpack project from ZIP" || true
+            git push || echo "Push skipped"
+          fi
+          test -f package.json || { echo "::error::package.json tidak ditemukan. Pastikan ZIP proyek sudah di-upload ke root repo."; exit 1; }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      # The runner already ships the Android SDK; only the licenses need accepting.
+      - name: Accept Android SDK licenses
+        run: yes | "${ANDROID_HOME:-/usr/local/lib/android/sdk}/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      # 2) Build the web dashboard.
+      - run: npm install --include=dev
+      - run: npm install --no-save @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7
+      - run: npx vite build
+
+      # 3) Wrap it as an Android project.
+      - run: npx cap add android
+      - name: App icons and splash
+        continue-on-error: true
+        run: npx --yes @capacitor/assets generate --android --iconBackgroundColor '#10141d' --iconBackgroundColorDark '#10141d' --splashBackgroundColor '#0e1118' --splashBackgroundColorDark '#0e1118'
+      - run: npx cap sync android
+
+      # 4) Fixed signing key so every build can be installed OVER the previous one.
+      - name: Use fixed debug keystore and bump version
+        run: |
+          mkdir -p ~/.android && cp ci/debug.keystore ~/.android/debug.keystore
+          sed -i "s/versionCode [0-9]*/versionCode ${{ github.run_number }}/; s/versionName \"[^\"]*\"/versionName \"1.0.${{ github.run_number }}\"/" android/app/build.gradle
+
+      - name: Build APK
+        working-directory: android
+        run: chmod +x gradlew && ./gradlew assembleDebug --no-daemon
+
+      - name: Collect APK
+        run: mkdir -p out && cp android/app/build/outputs/apk/debug/app-debug.apk out/BOTLAUNCH-AI.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BOTLAUNCH-AI-apk
+          path: out/BOTLAUNCH-AI.apk
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: BOTLAUNCH AI APK #${{ github.run_number }}
+          body: "Download BOTLAUNCH-AI.apk, install it on Android (allow installs from this source), then enter your server address and ADMIN_TOKEN."
+          files: out/BOTLAUNCH-AI.apk
